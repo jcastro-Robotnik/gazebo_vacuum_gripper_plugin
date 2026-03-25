@@ -87,6 +87,32 @@ Para añadir el plugin a un modelo, hay que incluir el bloque plugin dentro del 
 </plugin>
 ```
 
+Además, el link especificado en suction_link debe tener un sensor de contacto configurado que publique en el topic indicado en contact_topic.
+
+```xml
+<gazebo reference="${prefix}link_suction_gripper">
+
+	<sensor name="${prefix}suction_contact_sensor" type="contact">
+	
+	<always_on>true</always_on>
+	
+	<update_rate>50</update_rate>
+	
+	<contact>
+	
+	<collision>${prefix}link_suction_gripper_fixed_joint_lump__${prefix}body_collision_collision</collision>
+	
+	</contact>
+	
+	</sensor>
+
+</gazebo>
+```
+Puntos importantes de esta configuración:
+- El atributo reference debe coincidir exactamente con el nombre del link definido en suction_link del SDF del plugin (con el mismo prefix).
+- El sensor publica en el topic definido en contact_topic del plugin. Por defecto /suction_contact, pero debe coincidir con lo que se configure en el SDF del plugin.
+- El nombre de la collision dentro de <contact> lo genera el parser de URDF automáticamente al fusionar links con fixed joints. Si el modelo cambia, este nombre puede cambiar también hay que verificarlo con gz model --info o mirando el SDF generado.
+
 ## Limitaciones
 
 - El agarre no es físicamente exacto: el controlador PI puede generar vibraciones si los parámetros kP/kI son muy altos o si la masa del objeto es muy grande.
