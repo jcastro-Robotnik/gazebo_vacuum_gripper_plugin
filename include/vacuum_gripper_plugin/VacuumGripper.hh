@@ -12,6 +12,8 @@
 #include <gz/sim/Model.hh>
 #include <gz/sim/System.hh>
 #include <gz/transport/Node.hh>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 namespace vacuum_gripper_plugin
 {
@@ -53,6 +55,7 @@ public:
 private:
   void OnVacuumCmd(const gz::msgs::Boolean &_msg);
   void OnContacts(const gz::msgs::Contacts &_msg);
+  void PublishRosContact(bool _contact);
 
   bool IsAllowedModel(const std::string &_name) const;
 
@@ -64,19 +67,26 @@ private:
   gz::sim::Entity modelEntity{gz::sim::kNullEntity};
   gz::sim::Entity suctionLinkEntity{gz::sim::kNullEntity};
 
-  std::string suctionLinkName{"vacuum_link_suction_gripper"};
-  std::string contactTopic{"/suction_contact"};
+  // Nombre del link de succi\u00f3n (debe ser la punta real, ej: vacuum_suction_tip_link)
+  std::string suctionLinkName{"vacuum_suction_tip_link"};
+  std::string contactSensorName;
+  std::string contactTopic;
   std::string cmdTopic{"/vacuum_on"};
+  std::string rosContactTopic{"/gripper_contact"};
 
   double maxDistance{0.25};
   std::vector<std::string> allowedPrefixes;
 
   gz::transport::Node node;
+  rclcpp::Context::SharedPtr rosContext;
+  rclcpp::Node::SharedPtr rosNode;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr rosContactPub;
   std::mutex mutex;
 
   bool configured{false};
   bool vacuumOn{false};
   bool holding{false};
+  bool lastPublishedContact{false};
 
   // true en el primer PreUpdate tras detectar agarre:
   // permite calcular el offset en la misma fase en que se aplica (evita teleport)
@@ -85,12 +95,7 @@ private:
   gz::sim::Entity  heldModelEntity{gz::sim::kNullEntity};
   std::string      heldModelName;
   gz::math::Pose3d heldOffsetFromSuction;
-
-  // Controlador PI
-  gz::math::Vector3d integralLin{gz::math::Vector3d::Zero};
-  gz::math::Vector3d integralAng{gz::math::Vector3d::Zero};
-  static constexpr double kIMaxLin{2.0};   // umbral anti-windup lineal (m/s)
-  static constexpr double kIMaxAng{1.5};   // umbral anti-windup angular (rad/s)
+  gz::math::Vector3d heldContactPointWorld{gz::math::Vector3d::Zero};
 
   // Candidatos con punto de contacto real, actualizados en cada tick del sensor
   std::vector<ContactCandidate> contactCandidates;

@@ -14,7 +14,9 @@ find_package(gz-math7 REQUIRED)
 find_package(gz-msgs10 REQUIRED)
 find_package(gz-sim8 REQUIRED)
 find_package(gz-transport13 REQUIRED)
+find_package(rclcpp REQUIRED)
 find_package(sdformat14 REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # ── Librería C++ del plugin Gazebo ────────────────────────────────────────────
 add_library(VacuumGripper SHARED
@@ -35,6 +37,11 @@ target_link_libraries(VacuumGripper
   gz-sim8::gz-sim8
   gz-transport13::gz-transport13
   sdformat14::sdformat14
+)
+
+ament_target_dependencies(VacuumGripper
+  rclcpp
+  std_msgs
 )
 
 install(

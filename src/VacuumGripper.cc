@@ -1,7 +1,6 @@
 #include "vacuum_gripper_plugin/VacuumGripper.hh"
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <sstream>
 
@@ -16,6 +15,7 @@
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/ParentEntity.hh>
 #include <gz/sim/components/Pose.hh>
+#include <gz/sim/components/PoseCmd.hh>
 #include <gz/sim/components/Static.hh>
 #include <sdf/sdf.hh>
 
@@ -29,19 +29,30 @@ std::vector<std::string> SplitCsv(const std::string &_text)
   std::vector<std::string> out;
   std::stringstream ss(_text);
   std::string item;
+
   while (std::getline(ss, item, ','))
   {
     item.erase(0, item.find_first_not_of(" \t"));
     item.erase(item.find_last_not_of(" \t") + 1);
+
     if (!item.empty())
       out.push_back(item);
   }
+
   return out;
 }
 }  // namespace
 
 VacuumGripper::VacuumGripper() = default;
-VacuumGripper::~VacuumGripper() = default;
+VacuumGripper::~VacuumGripper()
+{
+  this->rosContactPub.reset();
+  this->rosNode.reset();
+  if (this->rosContext) {
+    this->rosContext->shutdown("VacuumGripper plugin unloaded");
+    this->rosContext.reset();
+  }
+}
 
 // ---------------------------------------------------------------------------
 void VacuumGripper::Configure(
@@ -63,52 +74,92 @@ void VacuumGripper::Configure(
 
   if (_sdf && _sdf->HasElement("suction_link"))
     this->suctionLinkName = _sdf->Get<std::string>("suction_link");
+
   if (_sdf && _sdf->HasElement("contact_topic"))
     this->contactTopic = _sdf->Get<std::string>("contact_topic");
+
   if (_sdf && _sdf->HasElement("cmd_topic"))
     this->cmdTopic = _sdf->Get<std::string>("cmd_topic");
+
+  if (_sdf && _sdf->HasElement("ros_contact_topic"))
+    this->rosContactTopic = _sdf->Get<std::string>("ros_contact_topic");
+
   if (_sdf && _sdf->HasElement("max_distance"))
     this->maxDistance = _sdf->Get<double>("max_distance");
+
   if (_sdf && _sdf->HasElement("allowed_prefixes"))
     this->allowedPrefixes = SplitCsv(_sdf->Get<std::string>("allowed_prefixes"));
 
-  std::cerr << "[VacuumGripper][DBG] SDF: suction_link=" << this->suctionLinkName
+  std::cerr << "[VacuumGripper][DBG] SDF:"
+            << " suction_link=" << this->suctionLinkName
             << " cmd_topic=" << this->cmdTopic
             << " contact_topic=" << this->contactTopic
-            << " max_distance=" << this->maxDistance << "\n";
+            << " ros_contact_topic=" << this->rosContactTopic
+            << " max_distance=" << this->maxDistance
+            << "\n";
 
   this->suctionLinkEntity = this->model.LinkByName(_ecm, this->suctionLinkName);
+
   if (this->suctionLinkEntity == gz::sim::kNullEntity)
   {
-    gzerr << "[VacuumGripper] No se encontro suction_link=[" << this->suctionLinkName << "]\n";
+    gzerr << "[VacuumGripper] No se encontro suction_link=["
+          << this->suctionLinkName << "]\n";
     return;
   }
-  std::cerr << "[VacuumGripper][DBG] suctionLinkEntity=" << this->suctionLinkEntity << "\n";
+
+  std::cerr << "[VacuumGripper][DBG] suctionLinkEntity="
+            << this->suctionLinkEntity << "\n";
 
   if (!this->node.Subscribe(this->cmdTopic, &VacuumGripper::OnVacuumCmd, this))
   {
-    gzerr << "[VacuumGripper] Fallo subscribe cmd_topic=[" << this->cmdTopic << "]\n";
+    gzerr << "[VacuumGripper] Fallo subscribe cmd_topic=["
+          << this->cmdTopic << "]\n";
     return;
   }
+
   if (!this->node.Subscribe(this->contactTopic, &VacuumGripper::OnContacts, this))
   {
-    gzerr << "[VacuumGripper] Fallo subscribe contact_topic=[" << this->contactTopic << "]\n";
+    gzerr << "[VacuumGripper] Fallo subscribe contact_topic=["
+          << this->contactTopic << "]\n";
+    return;
+  }
+
+  try
+  {
+    this->rosContext = std::make_shared<rclcpp::Context>();
+    this->rosContext->init(0, nullptr);
+    rclcpp::NodeOptions options;
+    options.context(this->rosContext);
+    this->rosNode = std::make_shared<rclcpp::Node>("vacuum_gripper_contact_publisher", options);
+    this->rosContactPub =
+      this->rosNode->create_publisher<std_msgs::msg::Bool>(this->rosContactTopic, 10);
+    this->PublishRosContact(false);
+  }
+  catch (const std::exception &e)
+  {
+    gzerr << "[VacuumGripper] No se pudo crear publicador ROS de contacto: "
+          << e.what() << "\n";
     return;
   }
 
   gzmsg << "[VacuumGripper] Cargado correctamente\n"
         << "  suction_link    : " << this->suctionLinkName << "\n"
         << "  contact_topic   : " << this->contactTopic << "\n"
+        << "  ros_contact     : " << this->rosContactTopic << "\n"
         << "  cmd_topic       : " << this->cmdTopic << "\n"
         << "  max_distance    : " << this->maxDistance << "\n";
 
   if (!this->allowedPrefixes.empty())
   {
     gzmsg << "  allowed_prefixes: ";
-    for (const auto &p : this->allowedPrefixes) gzmsg << p << " ";
+    for (const auto &p : this->allowedPrefixes)
+      gzmsg << p << " ";
     gzmsg << "\n";
   }
-  else { gzmsg << "  allowed_prefixes: <cualquiera>\n"; }
+  else
+  {
+    gzmsg << "  allowed_prefixes: <cualquiera>\n";
+  }
 
   this->configured = true;
   std::cerr << "[VacuumGripper][DBG] Configure() OK\n";
@@ -117,24 +168,44 @@ void VacuumGripper::Configure(
 // ---------------------------------------------------------------------------
 void VacuumGripper::OnVacuumCmd(const gz::msgs::Boolean &_msg)
 {
-  std::cerr << "[VacuumGripper][DBG] OnVacuumCmd() data=" << _msg.data() << "\n";
+  std::cerr << "[VacuumGripper][DBG] OnVacuumCmd() data="
+            << _msg.data() << "\n";
+
   std::lock_guard<std::mutex> lock(this->mutex);
+
   this->vacuumOn = _msg.data();
-  gzmsg << "[VacuumGripper] Comando recibido: vacuum_on=" << this->vacuumOn << "\n";
+  if (!this->vacuumOn)
+  {
+    this->contactCandidates.clear();
+  }
+
+  gzmsg << "[VacuumGripper] Comando recibido: vacuum_on="
+        << this->vacuumOn << "\n";
 }
 
 // ---------------------------------------------------------------------------
 void VacuumGripper::OnContacts(const gz::msgs::Contacts &_msg)
 {
-  std::cerr << "[VacuumGripper][DBG] OnContacts() contact_size=" << _msg.contact_size() << "\n";
+  std::cerr << "[VacuumGripper][DBG] OnContacts() contact_size="
+            << _msg.contact_size() << "\n";
+
   std::lock_guard<std::mutex> lock(this->mutex);
+
+  this->PublishRosContact(_msg.contact_size() > 0);
+
   this->contactCandidates.clear();
+  if (!this->vacuumOn)
+  {
+    std::cerr << "[VacuumGripper][DBG] OnContacts() ignorado: vacuumOff\n";
+    return;
+  }
 
   for (int i = 0; i < _msg.contact_size(); ++i)
   {
     const auto &contact = _msg.contact(i);
 
     gz::math::Vector3d contactPt{0.0, 0.0, 0.0};
+
     if (contact.position_size() > 0)
     {
       const auto &p = contact.position(0);
@@ -142,133 +213,227 @@ void VacuumGripper::OnContacts(const gz::msgs::Contacts &_msg)
     }
 
     std::cerr << "[VacuumGripper][DBG] contacto[" << i << "]"
-              << " col1.id=" << (contact.has_collision1() ? std::to_string(contact.collision1().id()) : "N/A")
-              << " col2.id=" << (contact.has_collision2() ? std::to_string(contact.collision2().id()) : "N/A")
-              << " pt=(" << contactPt.X() << "," << contactPt.Y() << "," << contactPt.Z() << ")\n";
+              << " col1.id="
+              << (contact.has_collision1()
+                    ? std::to_string(contact.collision1().id())
+                    : "N/A")
+              << " col2.id="
+              << (contact.has_collision2()
+                    ? std::to_string(contact.collision2().id())
+                    : "N/A")
+              << " pt=("
+              << contactPt.X() << ","
+              << contactPt.Y() << ","
+              << contactPt.Z() << ")\n";
 
     if (contact.has_collision1())
     {
       ContactCandidate c;
-      c.collisionEntity   = static_cast<gz::sim::Entity>(contact.collision1().id());
+      c.collisionEntity =
+          static_cast<gz::sim::Entity>(contact.collision1().id());
       c.contactPointWorld = contactPt;
       this->contactCandidates.push_back(c);
     }
+
     if (contact.has_collision2())
     {
       ContactCandidate c;
-      c.collisionEntity   = static_cast<gz::sim::Entity>(contact.collision2().id());
+      c.collisionEntity =
+          static_cast<gz::sim::Entity>(contact.collision2().id());
       c.contactPointWorld = contactPt;
       this->contactCandidates.push_back(c);
     }
   }
-  std::cerr << "[VacuumGripper][DBG] contactCandidates.size()=" << this->contactCandidates.size() << "\n";
+
+  std::cerr << "[VacuumGripper][DBG] contactCandidates.size()="
+            << this->contactCandidates.size() << "\n";
+}
+
+// ---------------------------------------------------------------------------
+void VacuumGripper::PublishRosContact(bool _contact)
+{
+  if (!this->rosContactPub)
+    return;
+
+  if (_contact == this->lastPublishedContact)
+    return;
+
+  std_msgs::msg::Bool msg;
+  msg.data = _contact;
+  this->rosContactPub->publish(msg);
+  this->lastPublishedContact = _contact;
 }
 
 // ---------------------------------------------------------------------------
 bool VacuumGripper::IsAllowedModel(const std::string &_name) const
 {
-  if (this->allowedPrefixes.empty()) return true;
+  if (this->allowedPrefixes.empty())
+    return true;
+
   for (const auto &prefix : this->allowedPrefixes)
-    if (_name.rfind(prefix, 0) == 0) return true;
+  {
+    if (_name.rfind(prefix, 0) == 0)
+      return true;
+  }
+
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// Release: limpia estado y elimina los velocity commands del modelo soltado
-// usando typeId (forma mas robusta en gz-sim8).
+// Release:
+// Limpia el estado de agarre y elimina los comandos que hacían que el modelo
+// agarrado se comportara de forma cinemática. Al quitar WorldPoseCmd y las
+// velocidades, Gazebo vuelve a controlar el objeto con física normal.
 // ---------------------------------------------------------------------------
 void VacuumGripper::Release(gz::sim::EntityComponentManager *_ecm)
 {
-  std::cerr << "[VacuumGripper][DBG] Release() modelo=[" << this->heldModelName
+  std::cerr << "[VacuumGripper][DBG] Release() modelo=["
+            << this->heldModelName
             << "] entity=" << this->heldModelEntity << "\n";
 
   if (_ecm && this->heldModelEntity != gz::sim::kNullEntity)
   {
-    // Usar typeId directamente: mas robusto que la version template en gz-sim8.
     const bool linRemoved = _ecm->RemoveComponent(
-        this->heldModelEntity,
-        gz::sim::components::LinearVelocityCmd::typeId);
-    const bool angRemoved = _ecm->RemoveComponent(
-        this->heldModelEntity,
-        gz::sim::components::AngularVelocityCmd::typeId);
+      this->heldModelEntity,
+      gz::sim::components::LinearVelocityCmd::typeId);
 
-    std::cerr << "[VacuumGripper][DBG] Release() LinearVelocityCmd removed=" << linRemoved
-              << " AngularVelocityCmd removed=" << angRemoved << "\n";
+    const bool angRemoved = _ecm->RemoveComponent(
+      this->heldModelEntity,
+      gz::sim::components::AngularVelocityCmd::typeId);
+
+    const bool poseRemoved = _ecm->RemoveComponent(
+      this->heldModelEntity,
+      gz::sim::components::WorldPoseCmd::typeId);
+
+    std::cerr << "[VacuumGripper][DBG] Release()"
+              << " LinearVelocityCmd removed=" << linRemoved
+              << " AngularVelocityCmd removed=" << angRemoved
+              << " WorldPoseCmd removed=" << poseRemoved
+              << "\n";
   }
 
-  this->holding         = false;
+  this->holding = false;
   this->needsOffsetInit = false;
   this->heldModelEntity = gz::sim::kNullEntity;
   this->heldModelName.clear();
   this->heldOffsetFromSuction = gz::math::Pose3d::Zero;
-  // Resetear integradores para el proximo agarre.
-  this->integralLin = gz::math::Vector3d::Zero;
-  this->integralAng = gz::math::Vector3d::Zero;
-  std::cerr << "[VacuumGripper][DBG] Release() integradores reseteados.\n";
+  this->heldContactPointWorld = gz::math::Vector3d::Zero;
+  this->contactCandidates.clear();
+
+  std::cerr << "[VacuumGripper][DBG] Release() comandos cinematicos limpiados.\n";
 }
 
 // ---------------------------------------------------------------------------
-// PostUpdate: detecta candidato de agarre por distancia al punto real de
-// contacto. Solo anota la entidad; el offset y el control de velocidad
-// empiezan en PreUpdate del tick siguiente.
+// PostUpdate:
+// Detecta candidatos de agarre a partir de los contactos recibidos.
+// La distancia se mide entre el punto de contacto y el suction_link.
+//
+// Importante:
+// Si en el URDF usas un link auxiliar en la punta de la ventosa, por ejemplo
+// vacuum_suction_tip_link, entonces suctionPose.Pos() representa la punta real.
 // ---------------------------------------------------------------------------
 void VacuumGripper::PostUpdate(
   const gz::sim::UpdateInfo &_info,
   const gz::sim::EntityComponentManager &_ecm)
 {
-  if (!this->configured || _info.paused) return;
+  if (!this->configured || _info.paused)
+    return;
 
   std::lock_guard<std::mutex> lock(this->mutex);
 
-  std::cerr << "[VacuumGripper][DBG] PostUpdate() vacuumOn=" << this->vacuumOn
+  std::cerr << "[VacuumGripper][DBG] PostUpdate()"
+            << " vacuumOn=" << this->vacuumOn
             << " holding=" << this->holding
-            << " candidates=" << this->contactCandidates.size() << "\n";
+            << " candidates=" << this->contactCandidates.size()
+            << "\n";
 
-  if (!this->vacuumOn || this->holding) return;
-  if (this->contactCandidates.empty()) return;
+  if (!this->vacuumOn)
+  {
+    this->contactCandidates.clear();
+    return;
+  }
 
-  const auto suctionPoseOpt = gz::sim::Link(this->suctionLinkEntity).WorldPose(_ecm);
+  if (this->holding)
+    return;
+
+  if (this->contactCandidates.empty())
+    return;
+
+  const auto suctionPoseOpt =
+      gz::sim::Link(this->suctionLinkEntity).WorldPose(_ecm);
+
   if (!suctionPoseOpt.has_value())
   {
     gzwarn << "[VacuumGripper] No se pudo obtener WorldPose del suction_link.\n";
     return;
   }
+
   const auto suctionPose = *suctionPoseOpt;
 
-  double bestDist           = this->maxDistance;
+  double bestDist = std::numeric_limits<double>::max();
   gz::sim::Entity bestModel = gz::sim::kNullEntity;
   std::string bestName;
+  gz::math::Vector3d bestContactPointWorld{0.0, 0.0, 0.0};
 
   for (const auto &candidate : this->contactCandidates)
   {
-    if (candidate.collisionEntity == gz::sim::kNullEntity) continue;
+    if (candidate.collisionEntity == gz::sim::kNullEntity)
+      continue;
 
     const gz::sim::Entity topModel =
         gz::sim::topLevelModel(candidate.collisionEntity, _ecm);
-    if (topModel == gz::sim::kNullEntity) continue;
-    if (topModel == this->modelEntity) continue;
 
-    const auto *nameComp = _ecm.Component<gz::sim::components::Name>(topModel);
+    if (topModel == gz::sim::kNullEntity)
+      continue;
+
+    if (topModel == this->modelEntity)
+      continue;
+
+    const auto *nameComp =
+        _ecm.Component<gz::sim::components::Name>(topModel);
+
     const std::string modelName = nameComp ? nameComp->Data() : "";
-    if (!this->IsAllowedModel(modelName)) continue;
 
-    const auto *staticComp = _ecm.Component<gz::sim::components::Static>(topModel);
-    if (staticComp && staticComp->Data()) continue;
+    if (!this->IsAllowedModel(modelName))
+      continue;
 
-    const double dist = candidate.contactPointWorld.Distance(suctionPose.Pos());
+    const auto *staticComp =
+        _ecm.Component<gz::sim::components::Static>(topModel);
 
-    std::cerr << "[VacuumGripper][DBG] PostUpdate() candidato=[" << modelName
-              << "] dist_contact=" << dist << " max=" << this->maxDistance << "\n";
+    if (staticComp && staticComp->Data())
+      continue;
 
-    gzmsg << "[VacuumGripper] Candidato modelo=[" << modelName
+    const double dist =
+        candidate.contactPointWorld.Distance(suctionPose.Pos());
+
+    std::cerr << "[VacuumGripper][DBG] PostUpdate() candidato=["
+              << modelName
+              << "] dist_contact=" << dist
+              << " max=" << this->maxDistance
+              << " suctionTip=("
+              << suctionPose.Pos().X() << ","
+              << suctionPose.Pos().Y() << ","
+              << suctionPose.Pos().Z() << ")"
+              << " contact=("
+              << candidate.contactPointWorld.X() << ","
+              << candidate.contactPointWorld.Y() << ","
+              << candidate.contactPointWorld.Z() << ")"
+              << "\n";
+
+    gzmsg << "[VacuumGripper] Candidato modelo=["
+          << modelName
           << "] entity=" << topModel
-          << " dist_contact=" << dist << " max=" << this->maxDistance << "\n";
+          << " dist_contact=" << dist
+          << " max=" << this->maxDistance
+          << "\n";
 
     if (dist <= bestDist)
     {
-      bestDist  = dist;
+      bestDist = dist;
       bestModel = topModel;
-      bestName  = modelName;
+      bestName = modelName;
+      bestContactPointWorld =
+        dist <= this->maxDistance ? candidate.contactPointWorld : suctionPose.Pos();
     }
   }
 
@@ -279,56 +444,70 @@ void VacuumGripper::PostUpdate(
   }
 
   this->heldModelEntity = bestModel;
-  this->heldModelName   = bestName;
-  this->holding         = true;
-  this->needsOffsetInit = true;  // offset se calcula en PreUpdate (misma fase que el control)
+  this->heldModelName = bestName;
+  this->heldContactPointWorld = bestContactPointWorld;
+  this->holding = true;
+  this->needsOffsetInit = true;
 
-  gzmsg << "[VacuumGripper] Agarre detectado modelo=[" << bestName
-        << "] dist_contact=" << bestDist << " m\n";
-  std::cerr << "[VacuumGripper][DBG] PostUpdate() holding=true needsOffsetInit=true modelo=["
-            << bestName << "] entity=" << bestModel << "\n";
+  gzmsg << "[VacuumGripper] Agarre detectado modelo=["
+        << bestName
+        << "] dist_contact=" << bestDist
+        << " m"
+        << (bestDist > this->maxDistance ? " (aceptado por sensor de contacto)" : "")
+        << "\n";
+
+  std::cerr << "[VacuumGripper][DBG] PostUpdate()"
+            << " holding=true"
+            << " needsOffsetInit=true"
+            << " modelo=[" << bestName << "]"
+            << " entity=" << bestModel
+            << "\n";
 }
 
 // ---------------------------------------------------------------------------
-// PreUpdate: controla la posicion del objeto agarrado mediante un controlador
-// proporcional sobre LinearVelocityCmd / AngularVelocityCmd.
+// PreUpdate:
+// Mientras hay agarre:
+//   - calcula una vez el offset desde la punta de succión hasta el objeto,
+//   - impone WorldPoseCmd cada tick como si el objeto estuviera soldado,
+//   - fuerza velocidades lineal/angular a cero.
 //
-// Por que velocidades en vez de escribir en Pose:
-//   El motor de fisica (Bullet/DART) mantiene su propio estado interno de
-//   posiciones y velocidades. El componente Pose del ECM es SALIDA del motor,
-//   no entrada: escribir en el hace que el SceneBroadcaster lo propague a la
-//   GUI, pero el motor lo sobreescribe en el siguiente paso. LinearVelocityCmd
-//   y AngularVelocityCmd SI son leidos por el sistema Physics y aplicados al
-//   cuerpo rigido interno, por lo que son el mecanismo correcto.
-//
-// Al soltar, se eliminan los componentes con RemoveComponent(typeId) para
-// que el motor de fisica recupere el control completo del objeto.
+// Esta versión asume que suction_link es el frame/link colocado en la punta
+// real de la ventosa, por ejemplo vacuum_suction_tip_link.
 // ---------------------------------------------------------------------------
 void VacuumGripper::PreUpdate(
   const gz::sim::UpdateInfo &_info,
   gz::sim::EntityComponentManager &_ecm)
 {
-  if (!this->configured || _info.paused) return;
+  if (!this->configured || _info.paused)
+    return;
 
   std::lock_guard<std::mutex> lock(this->mutex);
 
-  std::cerr << "[VacuumGripper][DBG] PreUpdate() vacuumOn=" << this->vacuumOn
+  std::cerr << "[VacuumGripper][DBG] PreUpdate()"
+            << " vacuumOn=" << this->vacuumOn
             << " holding=" << this->holding
             << " needsOffsetInit=" << this->needsOffsetInit
-            << " heldEntity=" << this->heldModelEntity << "\n";
+            << " heldEntity=" << this->heldModelEntity
+            << "\n";
 
   if (!this->vacuumOn)
   {
+    this->contactCandidates.clear();
     if (this->holding)
     {
-      gzmsg << "[VacuumGripper] Soltando modelo [" << this->heldModelName << "]\n";
+      gzmsg << "[VacuumGripper] Soltando modelo ["
+            << this->heldModelName << "]\n";
+
       std::cerr << "[VacuumGripper][DBG] PreUpdate() vacuumOn=0 -> Release()\n";
+
       this->Release(&_ecm);
     }
+
     return;
   }
 
-  if (!this->holding) return;
+  if (!this->holding)
+    return;
 
   if (this->heldModelEntity == gz::sim::kNullEntity)
   {
@@ -337,91 +516,119 @@ void VacuumGripper::PreUpdate(
     return;
   }
 
-  const auto suctionPoseOpt = gz::sim::Link(this->suctionLinkEntity).WorldPose(_ecm);
-  if (!suctionPoseOpt.has_value()) return;
+  const auto suctionPoseOpt =
+      gz::sim::Link(this->suctionLinkEntity).WorldPose(_ecm);
+
+  if (!suctionPoseOpt.has_value())
+    return;
+
   const auto suctionPose = *suctionPoseOpt;
 
-  // Primer tick tras agarre: calcular offset en la misma fase que el control.
+  // Primer tick tras el agarre:
+  // Calculamos el offset desde la punta real de succión hasta el origen
+  // del modelo agarrado.
   if (this->needsOffsetInit)
   {
-    const auto modelPose = gz::sim::worldPose(this->heldModelEntity, _ecm);
-    this->heldOffsetFromSuction = suctionPose.Inverse() * modelPose;
+    const auto modelPose =
+        gz::sim::worldPose(this->heldModelEntity, _ecm);
+
+    const gz::math::Vector3d suctionToModelWorld =
+        modelPose.Pos() - suctionPose.Pos();
+
+    const gz::math::Vector3d suctionToModelLocal =
+        suctionPose.Rot().RotateVectorReverse(suctionToModelWorld);
+
+    const gz::math::Quaterniond modelRotFromSuction =
+        suctionPose.Rot().Inverse() * modelPose.Rot();
+
+    this->heldOffsetFromSuction = gz::math::Pose3d(
+        suctionToModelLocal,
+        modelRotFromSuction);
+
     this->needsOffsetInit = false;
-    std::cerr << "[VacuumGripper][DBG] PreUpdate() offset inicializado. modelPose=("
-              << modelPose.Pos().X() << "," << modelPose.Pos().Y() << "," << modelPose.Pos().Z() << ")\n";
-    gzmsg << "[VacuumGripper] Agarrado modelo [" << this->heldModelName << "] offset fijado.\n";
+
+    std::cerr << "[VacuumGripper][DBG] PreUpdate() offset inicializado."
+              << " modelPose=("
+              << modelPose.Pos().X() << ","
+              << modelPose.Pos().Y() << ","
+              << modelPose.Pos().Z() << ")"
+              << " suctionTip=("
+              << suctionPose.Pos().X() << ","
+              << suctionPose.Pos().Y() << ","
+              << suctionPose.Pos().Z() << ")"
+              << " contactPoint=("
+              << this->heldContactPointWorld.X() << ","
+              << this->heldContactPointWorld.Y() << ","
+              << this->heldContactPointWorld.Z() << ")"
+              << " suctionToModelLocal=("
+              << suctionToModelLocal.X() << ","
+              << suctionToModelLocal.Y() << ","
+              << suctionToModelLocal.Z() << ")"
+              << "\n";
+
+    gzmsg << "[VacuumGripper] Agarrado modelo ["
+          << this->heldModelName
+          << "] offset fijado respecto a suction_link.\n";
   }
 
-  const auto targetPose  = suctionPose * this->heldOffsetFromSuction;
-  const auto currentPose = gz::sim::worldPose(this->heldModelEntity, _ecm);
-
-  // Controlador PI:
-  //   kP agresivo (1.5/dt) para seguimiento rapido.
-  //   kI acumula el error residual para eliminar offset estatico cuando el
-  //       objeto tiene peso y el P solo no alcanza.
-  //   Anti-windup: el integrador se satura a kIMaxLin / kIMaxAng para evitar
-  //       sobrepaso cuando el error es grande al inicio del agarre.
-  const double dt = std::max(
-      std::chrono::duration<double>(_info.dt).count(), 1e-6);
-  const double kP  = 1.5 / dt;   // mas agresivo que antes (era 0.5/dt)
-  const double kI  = 0.8 / dt;   // termino integral
-
-  const auto posError = targetPose.Pos() - currentPose.Pos();
-
-  // Acumular integral lineal con saturacion (anti-windup).
-  this->integralLin += posError * (kI * dt);
-  const double iLinLen = this->integralLin.Length();
-  if (iLinLen > this->kIMaxLin)
-    this->integralLin = this->integralLin * (this->kIMaxLin / iLinLen);
-
-  const gz::math::Vector3d linVelCmd = posError * kP + this->integralLin;
-
-  // Error de orientacion y termino integral angular.
-  const auto rotErr = targetPose.Rot() * currentPose.Rot().Inverse();
-  gz::math::Vector3d rotAxis{0.0, 0.0, 1.0};
-  double rotAngle = 0.0;
-  rotErr.AxisAngle(rotAxis, rotAngle);
-  const gz::math::Vector3d angError = rotAxis * rotAngle;
-
-  this->integralAng += angError * (kI * dt);
-  const double iAngLen = this->integralAng.Length();
-  if (iAngLen > this->kIMaxAng)
-    this->integralAng = this->integralAng * (this->kIMaxAng / iAngLen);
-
-  const gz::math::Vector3d angVelCmd = angError * kP + this->integralAng;
+  const auto targetPose = suctionPose * this->heldOffsetFromSuction;
+  const gz::math::Vector3d zeroVel = gz::math::Vector3d::Zero;
 
   std::cerr << "[VacuumGripper][DBG] PreUpdate() targetPos=("
-            << targetPose.Pos().X() << "," << targetPose.Pos().Y() << "," << targetPose.Pos().Z() << ")"
-            << " posError=(" << posError.X() << "," << posError.Y() << "," << posError.Z() << ")"
-            << " linVelCmd=(" << linVelCmd.X() << "," << linVelCmd.Y() << "," << linVelCmd.Z() << ")"
-            << " integralLin=(" << this->integralLin.X() << "," << this->integralLin.Y() << "," << this->integralLin.Z() << ")\n";
+            << targetPose.Pos().X() << ","
+            << targetPose.Pos().Y() << ","
+            << targetPose.Pos().Z() << ")"
+            << " modo=kinematic_world_pose_cmd\n";
 
-  // Aplicar LinearVelocityCmd.
-  auto *linComp = _ecm.Component<gz::sim::components::LinearVelocityCmd>(
-      this->heldModelEntity);
+  auto *poseComp =
+      _ecm.Component<gz::sim::components::WorldPoseCmd>(
+        this->heldModelEntity);
+
+  if (!poseComp)
+  {
+    _ecm.CreateComponent(
+      this->heldModelEntity,
+      gz::sim::components::WorldPoseCmd(targetPose));
+
+    std::cerr << "[VacuumGripper][DBG] PreUpdate() WorldPoseCmd creado.\n";
+  }
+  else
+  {
+    poseComp->SetData(targetPose, [](auto &, const auto &) { return true; });
+  }
+
+  auto *linComp =
+      _ecm.Component<gz::sim::components::LinearVelocityCmd>(
+        this->heldModelEntity);
+
   if (!linComp)
   {
-    _ecm.CreateComponent(this->heldModelEntity,
-        gz::sim::components::LinearVelocityCmd(linVelCmd));
+    _ecm.CreateComponent(
+      this->heldModelEntity,
+      gz::sim::components::LinearVelocityCmd(zeroVel));
+
     std::cerr << "[VacuumGripper][DBG] PreUpdate() LinearVelocityCmd creado.\n";
   }
   else
   {
-    linComp->SetData(linVelCmd, [](auto &, const auto &) { return true; });
+    linComp->SetData(zeroVel, [](auto &, const auto &) { return true; });
   }
 
-  // Aplicar AngularVelocityCmd.
-  auto *angComp = _ecm.Component<gz::sim::components::AngularVelocityCmd>(
-      this->heldModelEntity);
+  auto *angComp =
+      _ecm.Component<gz::sim::components::AngularVelocityCmd>(
+        this->heldModelEntity);
+
   if (!angComp)
   {
-    _ecm.CreateComponent(this->heldModelEntity,
-        gz::sim::components::AngularVelocityCmd(angVelCmd));
+    _ecm.CreateComponent(
+      this->heldModelEntity,
+      gz::sim::components::AngularVelocityCmd(zeroVel));
+
     std::cerr << "[VacuumGripper][DBG] PreUpdate() AngularVelocityCmd creado.\n";
   }
   else
   {
-    angComp->SetData(angVelCmd, [](auto &, const auto &) { return true; });
+    angComp->SetData(zeroVel, [](auto &, const auto &) { return true; });
   }
 }
 

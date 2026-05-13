@@ -21,7 +21,8 @@ Parámetros que se pueden configurar desde el SDF:
 | **Parámetro SDF** | **Tipo** | **Default**                 | **Descripción**                                                 |
 | ----------------- | -------- | --------------------------- | --------------------------------------------------------------- |
 | suction_link      | string   | vacuum_link_suction_gripper | Nombre del link del gripper                                     |
-| contact_topic     | string   | /suction_contact            | Topic de contactos del sensor                                   |
+| contact_sensor    | string   | derivado de suction_link    | Nombre del sensor de contacto usado para resolver el topic real |
+| contact_topic     | string   | vacío                       | Topic manual de contactos; si se omite, se autodetecta          |
 | cmd_topic         | string   | /vacuum_on                  | Topic de comando on/off                                         |
 | max_distance      | double   | 0.25                        | Distancia máxima de agarre (m)                                  |
 | allowed_prefixes  | string   | (vacío = todos)             | Lista CSV de prefijos de modelo permitidos (ej: caja, box, etc) |
@@ -74,9 +75,7 @@ Para añadir el plugin a un modelo, hay que incluir el bloque plugin dentro del 
 
 	<suction_link>vacuum_link_suction_gripper</suction_link>
 	
-	<!-- robot_b es el prefijo de mi robot, de todas formas el nombre del topic es personalizable -->
-	
-	<contact_topic>/robot_b/suction_contact</contact_topic>
+	<contact_sensor>vacuum_suction_contact_sensor</contact_sensor>
 	
 	<cmd_topic>/robot_b/vacuum_on</cmd_topic> 
 	
@@ -87,11 +86,37 @@ Para añadir el plugin a un modelo, hay que incluir el bloque plugin dentro del 
 </plugin>
 ```
 
+Además, el link especificado en suction_link debe tener un sensor de contacto. Si no se configura contact_topic, el plugin resuelve automáticamente el topic real creado por Gazebo para ese sensor, incluyendo el mundo y el namespace/modelo actual.
+
+```xml
+<gazebo reference="${prefix}link_suction_gripper">
+
+	<sensor name="${prefix}suction_contact_sensor" type="contact">
+	
+	<always_on>true</always_on>
+	
+	<update_rate>50</update_rate>
+	
+	<contact>
+	
+	<collision>${prefix}link_suction_gripper_fixed_joint_lump__${prefix}body_collision_collision</collision>
+	
+	</contact>
+	
+	</sensor>
+
+</gazebo>
+```
+Puntos importantes de esta configuración:
+- El atributo reference debe coincidir exactamente con el nombre del link definido en suction_link del SDF del plugin (con el mismo prefix).
+- No hace falta fijar manualmente el topic del sensor. Si se usa contact_topic, debe coincidir con el topic de Gazebo; si se omite, el plugin lo autodetecta.
+- El nombre de la collision dentro de <contact> lo genera el parser de URDF automáticamente al fusionar links con fixed joints. Si el modelo cambia, este nombre puede cambiar también hay que verificarlo con gz model --info o mirando el SDF generado.
+
 ## Limitaciones
 
 - El agarre no es físicamente exacto: el controlador PI puede generar vibraciones si los parámetros kP/kI son muy altos o si la masa del objeto es muy grande.
 - Solo puede agarrar un objeto a la vez. No hay soporte para agarrar varios simultáneamente.
-- El topic del bridge está hardcodeado a /robot_b/vacuum_on_ros. Si se tienen varios robots, hay que modificar el nodo o parametrizarlo.
+- El bridge usa el namespace ROS 2 del nodo para construir /<robot_ns>/vacuum_on_ros y /<robot_ns>/vacuum_on. Tambien acepta los parametros ros_topic y gz_topic para sobrescribirlos.
 - Si el objeto es muy ligero o tiene física inestable, el controlador puede hacer que 'vibre' o se escape. Ajustar max_distance y los topes del integrador puede ayudar.
 
 ## Nodo bridge Python
